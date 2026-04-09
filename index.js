@@ -5,7 +5,6 @@ const {
   joinVoiceChannel,
   createAudioPlayer,
   createAudioResource,
-  AudioPlayerStatus
 } = require("@discordjs/voice");
 
 const gTTS = require("gtts");
@@ -25,37 +24,42 @@ let player = createAudioPlayer();
 let textChannelId = null;
 let voiceChannelId = null;
 
+// 🔊 Queue system
 let queue = [];
 let isPlaying = false;
 let lastUser = null;
 let userVoices = {};
 
-// 🔧 safer mention replace
+// 🎧 Replace mentions with names
 function replaceMentions(message) {
-  let content = message.content || "";
+  let content = message.content;
 
+  // User mentions
   message.mentions.users.forEach(user => {
     const member = message.guild.members.cache.get(user.id);
     const name = member ? member.displayName : user.username;
     content = content.replace(new RegExp(`<@!?${user.id}>`, "g"), name);
   });
 
+  // Role mentions
   message.mentions.roles.forEach(role => {
     content = content.replace(new RegExp(`<@&${role.id}>`, "g"), role.name);
   });
 
+  // Channel mentions
   message.mentions.channels.forEach(channel => {
     content = content.replace(new RegExp(`<#${channel.id}>`, "g"), channel.name);
   });
 
+  // Remove links
   content = content.replace(/https?:\/\/\S+/g, "link");
 
   return content;
 }
 
-// ▶️ play queue (safe)
+// ▶️ Play queue
 function playNext() {
-  if (!connection || queue.length === 0) {
+  if (queue.length === 0) {
     isPlaying = false;
     return;
   }
@@ -63,139 +67,110 @@ function playNext() {
   isPlaying = true;
   const { text, voice } = queue.shift();
 
-  console.log("Speaking:", text);
-
   const file = "tts.mp3";
   const tts = new gTTS(text, voice || "en");
 
   tts.save(file, () => {
-    try {
-      const resource = createAudioResource(file);
+    const resource = createAudioResource(file);
 
-      connection.subscribe(player);
-      player.play(resource);
+    connection.subscribe(player);
+    player.play(resource);
 
-      player.once(AudioPlayerStatus.Idle, () => {
-        try {
-          if (fs.existsSync(file)) fs.unlinkSync(file);
-        } catch {}
-
-        playNext();
-      });
-
-    } catch (err) {
-      console.error("Play error:", err);
+    player.once("idle", () => {
+      if (fs.existsSync(file)) fs.unlinkSync(file);
       playNext();
-    }
+    });
   });
 }
 
-// ✅ ready
+// ✅ Bot ready
 client.once(Events.ClientReady, () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
 
-// 🎮 commands (FIXED)
+// 🎮 Commands
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  try {
-    await interaction.deferReply(); // 🔥 fixes timeout
+  // JOIN
+  if (interaction.commandName === "join") {
+    const vc = interaction.member.voice.channel;
+    if (!vc) return interaction.reply("Join a VC first");
 
-    // JOIN
-    if (interaction.commandName === "join") {
-      const vc = interaction.member.voice.channel;
-      if (!vc) return interaction.editReply("Join a VC first");
+    connection = joinVoiceChannel({
+      channelId: vc.id,
+      guildId: interaction.guild.id,
+      adapterCreator: interaction.guild.voiceAdapterCreator,
+    });
 
-      connection = joinVoiceChannel({
-        channelId: vc.id,
-        guildId: interaction.guild.id,
-        adapterCreator: interaction.guild.voiceAdapterCreator,
-      });
+    voiceChannelId = vc.id;
+    textChannelId = interaction.channel.id;
 
-      voiceChannelId = vc.id;
-      textChannelId = interaction.channel.id;
+    interaction.reply("Joined VC and ready for TTS");
+  }
 
-      interaction.editReply("Joined VC and ready for TTS");
-    }
+  // LEAVE
+  if (interaction.commandName === "leave") {
+    if (connection) connection.destroy();
+    connection = null;
+    queue = [];
+    isPlaying = false;
+    interaction.reply("Left VC");
+  }
 
-    // LEAVE
-    else if (interaction.commandName === "leave") {
-      if (connection) connection.destroy();
-      connection = null;
-      queue = [];
-      isPlaying = false;
+  // VOICE
+  if (interaction.commandName === "voice") {
+    const voice = interaction.options.getString("type");
 
-      interaction.editReply("Left VC");
-    }
+    userVoices[interaction.user.id] = voice;
 
-    // VOICE
-    else if (interaction.commandName === "voice") {
-      const voice = interaction.options.getString("type");
-
-      userVoices[interaction.user.id] = voice;
-
-      interaction.editReply(`Voice set to ${voice}`);
-    }
-
-  } catch (err) {
-    console.error("Command error:", err);
-
-    if (interaction.deferred) {
-      interaction.editReply("Error occurred");
-    } else {
-      interaction.reply("Error occurred");
-    }
+    interaction.reply(`Voice set to ${voice}`);
   }
 });
 
-// 💬 messages (safer)
+// 💬 Message handler
 client.on(Events.MessageCreate, async (message) => {
-  try {
-    if (!connection) return;
-    if (message.author.bot) return;
-    if (message.channel.id !== textChannelId) return;
+  if (!connection) return;
+  if (message.author.bot) return;
+  if (message.channel.id !== textChannelId) return;
 
-    if (!message.member?.voice?.channel || message.member.voice.channel.id !== voiceChannelId) return;
+  if (!message.member.voice.channel || message.member.voice.channel.id !== voiceChannelId) return;
 
-    const name = message.member.displayName;
-    let text = "";
+  const name = message.member.displayName;
+  let text = "";
 
-    if (message.attachments.size > 0) {
-      text = `${name} shared an image`;
-      lastUser = message.author.id;
-    }
-
-    else if (message.stickers.size > 0) {
-      text = `${name} sent a sticker`;
-      lastUser = message.author.id;
-    }
-
-    else if (message.content) {
-      const cleanContent = replaceMentions(message);
-
-      if (!cleanContent) return;
-
-      if (lastUser === message.author.id) {
-        text = cleanContent;
-      } else {
-        text = `${name} says ${cleanContent}`;
-        lastUser = message.author.id;
-      }
-    }
-
-    if (!text) return;
-
-    queue.push({
-      text,
-      voice: userVoices[message.author.id] || "en"
-    });
-
-    if (!isPlaying) playNext();
-
-  } catch (err) {
-    console.error("Message error:", err);
+  // 🖼️ Image
+  if (message.attachments.size > 0) {
+    text = `${name} shared an image`;
+    lastUser = message.author.id;
   }
+
+  // 🎯 Sticker
+  else if (message.stickers.size > 0) {
+    text = `${name} sent a sticker`;
+    lastUser = message.author.id;
+  }
+
+  // 💬 Text
+  else if (message.content) {
+    const cleanContent = replaceMentions(message);
+
+    if (lastUser === message.author.id) {
+      text = cleanContent;
+    } else {
+      text = `${name} says ${cleanContent}`;
+      lastUser = message.author.id;
+    }
+  }
+
+  if (!text) return;
+
+  queue.push({
+    text,
+    voice: userVoices[message.author.id] || "en"
+  });
+
+  if (!isPlaying) playNext();
 });
 
 client.login(process.env.TOKEN);
